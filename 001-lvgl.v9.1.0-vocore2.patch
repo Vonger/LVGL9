@@ -1,0 +1,370 @@
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,8 @@
+ # Makefile
+ #
+ $(warning Using Make to build this project is deprecated, please switch to CMake)
+-CC ?= gcc
++CC = mipsel-openwrt-linux-gcc
++CXX = mipsel-openwrt-linux-g++
+ LVGL_DIR_NAME ?= lvgl
+ LVGL_DIR ?= ${shell pwd}
+ 
+@@ -14,8 +15,8 @@ WARNINGS ?= -Wall -Werror=float-conversion -Wextra \
+ 						-Wempty-body -Wshift-negative-value -Wstack-usage=2048 \
+             -Wtype-limits -Wsizeof-pointer-memaccess -Wpointer-arith
+ 
+-CFLAGS ?= -O3 -I$(LVGL_DIR)/ $(WARNINGS) `pkg-config --cflags wayland-client` `pkg-config --cflags xkbcommon`
+-LDFLAGS ?= -lSDL2 -lm `pkg-config --libs wayland-client` `pkg-config --libs xkbcommon` -lpthread
++CFLAGS ?= -O3 -I$(LVGL_DIR)/ -I$(STAGING_DIR)/target-mipsel_24kc_musl/usr/include/ $(WARNINGS) 
++LDFLAGS ?= -lm -lpthread -L$(STAGING_DIR)/target-mipsel_24kc_musl/usr/lib/ -lusb-1.0
+ BIN = demo
+ 
+ #Collect the files to compile
+--- a/lv_conf.h
++++ b/lv_conf.h
+@@ -233,8 +233,8 @@
+ #define LV_USE_ASSERT_NULL          1   /*Check if the parameter is NULL. (Very fast, recommended)*/
+ #define LV_USE_ASSERT_MALLOC        1   /*Checks is the memory is successfully allocated or no. (Very fast, recommended)*/
+ #define LV_USE_ASSERT_STYLE         1   /*Check if the styles are properly initialized. (Very fast, recommended)*/
+-#define LV_USE_ASSERT_MEM_INTEGRITY 1   /*Check the integrity of `lv_mem` after critical operations. (Slow)*/
+-#define LV_USE_ASSERT_OBJ           1   /*Check the object's type and existence (e.g. not deleted). (Slow)*/
++#define LV_USE_ASSERT_MEM_INTEGRITY 0   /*Check the integrity of `lv_mem` after critical operations. (Slow)*/
++#define LV_USE_ASSERT_OBJ           0   /*Check the object's type and existence (e.g. not deleted). (Slow)*/
+ 
+ /*Add a custom handler when assert happens e.g. to restart the MCU*/
+ #define LV_ASSERT_HANDLER_INCLUDE <stdint.h>
+@@ -829,7 +829,8 @@
+  *==================*/
+ 
+ /*Use SDL to open window on PC and handle mouse and keyboard*/
+-#define LV_USE_SDL              1
++#define LV_USE_VOCORE_LIBUSB    1
++#define LV_USE_SDL              0
+ #if LV_USE_SDL
+     #define LV_SDL_INCLUDE_PATH    <SDL2/SDL.h>
+     #define LV_SDL_RENDER_MODE     LV_DISPLAY_RENDER_MODE_DIRECT   /*LV_DISPLAY_RENDER_MODE_DIRECT is recommended for best performance*/
+--- /dev/null
++++ b/lvgl/src/drivers/display/vocore/lv_vocore_libusb.c
+@@ -0,0 +1,213 @@
++#include "lv_vocore_libusb.h"
++
++#if LV_USE_VOCORE_LIBUSB
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++#include <errno.h>
++#include <libusb-1.0/libusb.h>
++#include <lvgl/lvgl.h>
++
++typedef struct {
++    libusb_context *ctx;
++    libusb_device_handle *usb;
++    int w, h, line;
++    int run;
++    pthread_t flush_pid;
++    pthread_t touch_pid;
++    uint8_t *fbp;
++} lv_vocore_libusb_t;
++
++union axis{
++    struct hx{
++        unsigned char h:4;
++        unsigned char u:2;
++        unsigned char f:2;
++    } x;
++
++    struct hy{
++        unsigned char h:4;
++        unsigned char id:4;
++    } y;
++
++    char c;
++};
++
++struct point {
++    union axis xh;
++    unsigned char xl;
++    union axis yh;
++    unsigned char yl;
++
++    unsigned char weight;
++    unsigned char misc;
++};
++
++struct touch {
++    unsigned char id[2];
++    unsigned char count;
++    struct point p[2];
++};
++
++enum touch_status {
++    TOUCH_STATUS_PRESS,
++    TOUCH_STATUS_HOVER,
++    TOUCH_STATUS_DRAG,
++};
++
++#define TOUCH_SIZE sizeof(struct touch)
++
++struct touch touch_last;
++int touch_pending = 0;
++int screen_width = 0;
++int screen_height = 0;
++
++static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p)
++{
++    lv_vocore_libusb_t *dsc = lv_display_get_driver_data(disp);
++
++    if (dsc->usb == NULL || area->x2 < 0 || area->y2 < 0 ||
++        area->x1 > dsc->w - 1 || area->y1 > dsc->h - 1) {
++        lv_display_flush_ready(disp);
++        return;
++    }
++
++    lv_coord_t color_length = lv_area_get_width(area) * sizeof(uint16_t);
++    uint32_t fb_pos = area->x1 * sizeof(uint16_t) + area->y1 * dsc->line;
++
++    for (int32_t y = area->y1; y <= area->y2; y++) {
++        lv_memcpy(&dsc->fbp[fb_pos], color_p, color_length);
++        fb_pos += dsc->line;
++        color_p += color_length;
++    }
++
++    lv_disp_flush_ready(disp);
++}
++
++void *flush_thread(void *param)
++{
++    lv_vocore_libusb_t *dsc = param;
++    uint32_t size = dsc->w * dsc->h * sizeof(uint16_t);
++
++    uint8_t on[] = {0x00, 0x29};
++    libusb_control_transfer(dsc->usb, 0x40, 0xb0, 0, 0, on, 2, 100);
++
++    uint8_t cmd[] = {0x00, 0x2c, 0x00, 0xb8, 0x0b, 0x00};
++    while (dsc->run) {
++        libusb_control_transfer(dsc->usb, 0x40, 0xb0, 0, 0, cmd, 6, 100);
++        libusb_bulk_transfer(dsc->usb, 0x02, dsc->fbp, size, NULL, 100);
++    }
++    return NULL;
++}
++
++static void lv_vocore_touch_read(lv_indev_t *indev, lv_indev_data_t *data)
++{
++    // no touch data pending, ignore.
++    if (touch_pending == 0)
++        return;
++    touch_pending--;
++
++    struct touch *t = (struct touch *)&touch_last;
++    if (touch_pending == 0 || t->count == 0 ||
++        t->p[0].xh.x.f == TOUCH_STATUS_HOVER) {
++        data->state = LV_INDEV_STATE_RELEASED;
++        return;
++    }
++
++    /* for touch flip horizontal or veritcal, use this code to replace normal position.
++    data->point.x = screen_width - ((((int)t->p[0].xh.x.h) << 8) + t->p[0].xl);
++    data->point.y = screen_height - ((((int)t->p[0].yh.y.h) << 8) + t->p[0].yl);
++    */
++
++    data->point.x = (((int)t->p[0].xh.x.h) << 8) + t->p[0].xl;
++    data->point.y = (((int)t->p[0].yh.y.h) << 8) + t->p[0].yl;
++    data->state = LV_INDEV_STATE_PRESSED;
++}
++
++void touch_cb(struct libusb_transfer *trans)
++{
++    struct touch *t = (struct touch *)trans->buffer;
++
++    if (t->count == 1) {
++        memcpy(&touch_last, t, TOUCH_SIZE);
++        touch_pending = 2;
++    }
++
++    libusb_submit_transfer(trans);
++}
++
++void *touch_thread(void *param)
++{
++    lv_vocore_libusb_t *dsc = param;
++    while(1)
++        libusb_handle_events(dsc->ctx);
++
++    return NULL;
++}
++
++static void release_disp_cb(lv_event_t * e)
++{
++    lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
++
++    lv_vocore_libusb_t *dsc = lv_display_get_driver_data(disp);
++
++    // wait flush thread done.
++    dsc->run = 0;
++    pthread_join(dsc->flush_pid, NULL);
++
++    free(dsc->fbp);
++
++    lv_free(dsc);
++    lv_display_set_driver_data(disp, NULL);
++}
++
++lv_display_t *lv_vocore_libusb_create(int32_t w, int32_t h)
++{
++    lv_vocore_libusb_t *dsc = lv_malloc(sizeof(lv_vocore_libusb_t));
++    dsc->w = w;
++    dsc->h = h;
++    dsc->run = true;
++    dsc->line = dsc->w * sizeof(uint16_t);
++    dsc->fbp = malloc(dsc->w * dsc->h * sizeof(uint16_t));
++
++    screen_width = dsc->w;
++    screen_height = dsc->h;
++
++    // usb part
++    libusb_init(&dsc->ctx);
++    dsc->usb = libusb_open_device_with_vid_pid(dsc->ctx, 0xc872, 0x1004);
++    if (dsc->usb == NULL)
++        exit(-ENOENT);
++    libusb_claim_interface(dsc->usb, 0);
++    libusb_set_interface_alt_setting(dsc->usb, 0, 0);
++    libusb_detach_kernel_driver(dsc->usb, 0);
++
++    struct libusb_transfer *t = libusb_alloc_transfer(0);
++    libusb_fill_interrupt_transfer(t, dsc->usb, 0x81, malloc(TOUCH_SIZE),
++                                   TOUCH_SIZE, touch_cb, NULL, -1);
++    libusb_submit_transfer(t);
++
++    pthread_create(&dsc->flush_pid, NULL, flush_thread, dsc);
++    pthread_create(&dsc->touch_pid, NULL, touch_thread, dsc);
++
++    // lvgl display
++    lv_display_t *disp = lv_display_create(dsc->w, dsc->h);
++    if(disp == NULL)
++        return NULL;
++
++    lv_display_add_event_cb(disp, release_disp_cb, LV_EVENT_DELETE, disp);
++    lv_display_set_driver_data(disp, dsc);
++    lv_display_set_flush_cb(disp, flush_cb);
++    lv_display_set_buffers(disp, malloc(32 * 1024), NULL, 32 * 1024,
++                                LV_DISPLAY_RENDER_MODE_PARTIAL);
++
++    lv_indev_t *indev = lv_indev_create();
++    if(indev == NULL)
++        return NULL;
++    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
++    lv_indev_set_read_cb(indev, lv_vocore_touch_read);
++    return disp;
++}
++
++#endif /*LV_USE_VOCORE_LIBUSB*/
+--- /dev/null
++++ b/lvgl/src/drivers/display/vocore/lv_vocore_libusb.h
+@@ -0,0 +1,21 @@
++#ifndef LV_VOCORE_LIBUSB_H
++#define LV_VOCORE_LIBUSB_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include "../../../display/lv_display.h"
++#include "../../../indev/lv_indev.h"
++
++#if LV_USE_VOCORE_LIBUSB
++
++lv_display_t * lv_vocore_libusb_create(int32_t w, int32_t h);
++
++#endif /* LV_USE_VOCORE_LIBUSB */
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#endif /* LV_VOCORE_LIBUSB_H */
+--- a/lvgl/src/drivers/lv_drivers.h
++++ b/lvgl/src/drivers/lv_drivers.h
+@@ -22,6 +22,7 @@ extern "C" {
+ 
+ #include "display/drm/lv_linux_drm.h"
+ #include "display/fb/lv_linux_fbdev.h"
++#include "display/vocore/lv_vocore_libusb.h"
+ 
+ #include "display/tft_espi/lv_tft_espi.h"
+
+--- a/main.c
++++ b/main.c
+@@ -9,6 +9,7 @@
+ #define _DEFAULT_SOURCE /* needed for usleep() */
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <pthread.h>
+ #include "lvgl/lvgl.h"
+ #include "lvgl/examples/lv_examples.h"
+ #include "lvgl/demos/lv_demos.h"
+@@ -58,6 +59,15 @@ static lv_display_t * hal_init(int32_t w, int32_t h);
+  *   GLOBAL FUNCTIONS
+  **********************/
+ 
++void *tick_thread(void *unused)
++{
++  while(1) {
++    usleep(5000);
++    lv_tick_inc(5);
++  }
++  return NULL;
++}
++
+ int main(int argc, char **argv)
+ {
+   (void)argc; /*Unused*/
+@@ -67,7 +77,10 @@ int main(int argc, char **argv)
+   lv_init();
+ 
+   /*Initialize the display, and the input devices*/
+-  hal_init(480, 320);
++  lv_display_set_default(lv_vocore_libusb_create(480, 800));
++
++  pthread_t pid;
++  pthread_create(&pid, NULL, tick_thread, NULL);
+ 
+   /*Open a demo or an example*/
+   if (argc == 0) {
+@@ -98,35 +111,3 @@ demo_end:
+ /**********************
+  *   STATIC FUNCTIONS
+  **********************/
+-
+-/**
+- * Initialize the Hardware Abstraction Layer (HAL) for the LVGL graphics
+- * library
+- */
+-static lv_display_t * hal_init(int32_t w, int32_t h)
+-{
+-
+-//    lv_group_set_default(lv_group_create());
+-
+-  lv_display_t * disp = lv_sdl_window_create(w, h);
+-
+-  lv_indev_t * mouse = lv_sdl_mouse_create();
+-  lv_indev_set_group(mouse, lv_group_get_default());
+-  lv_indev_set_disp(mouse, disp);
+-  lv_display_set_default(disp);
+-
+-  LV_IMAGE_DECLARE(mouse_cursor_icon); /*Declare the image file.*/
+-  lv_obj_t * cursor_obj;
+-  cursor_obj = lv_image_create(lv_screen_active()); /*Create an image object for the cursor */
+-  lv_image_set_src(cursor_obj, &mouse_cursor_icon);           /*Set the image source*/
+-  lv_indev_set_cursor(mouse, cursor_obj);             /*Connect the image  object to the driver*/
+-
+-  lv_indev_t * mousewheel = lv_sdl_mousewheel_create();
+-  lv_indev_set_disp(mousewheel, disp);
+-
+-  lv_indev_t * keyboard = lv_sdl_keyboard_create();
+-  lv_indev_set_disp(keyboard, disp);
+-  lv_indev_set_group(keyboard, lv_group_get_default());
+-
+-  return disp;
+-}
